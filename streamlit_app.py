@@ -1,3 +1,99 @@
+import csv
+import io
+import json
+import re
+import unicodedata
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+
+import streamlit as st
+
+st.set_page_config(page_title='Radar Político | ABIUY', page_icon='📡', layout='wide')
+st.title('📡 Radar Político | ABIUY')
+st.caption('Versión 0.2 · Observatorio de publicaciones públicas · Datos verificables')
+st.info('Cobertura parcial: Google News y Bluesky (si la API responde), más CSV importados. No es un censo de X, Instagram ni Facebook.')
+
+STOP = set('sobre desde entre hasta junto tras ante para como este esta estos estas esas esos pero porque donde cuando quien quienes algo todo toda todos todas hacia tiene tuvo sera fueron unas unos para cada muy mas sus del los las una uno que con por sin hay fue ser dijo dice bajo tambien uruguay noticia noticias senado senador'.split())
+CATEGORIAS = {
+    'Parlamento': ['senado','senador','parlamento','comision','proyecto de ley','diputados','legislador'],
+    'Seguridad': ['seguridad','policia','delito','homicidio','narcotrafico','carcel'],
+    'Economía': ['economia','impuesto','empleo','salario','presupuesto','inflacion'],
+    'Educación': ['educacion','escuela','universidad','liceo','docentes'],
+    'Relaciones políticas': ['partido colorado','partido nacional','frente amplio','coalicion','gobierno'],
+}
+
+def norm(s):
+    return ''.join(x for x in unicodedata.normalize('NFKD', str(s).lower()) if not unicodedata.combining(x))
+
+def req_json(url):
+    request = urllib.request.Request(url, headers={'User-Agent':'RadarPoliticoAbiuy/0.2 (public research)'})
+    with urllib.request.urlopen(request, timeout=14) as response:
+        return json.load(response)
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_news(query, days):
+    rss_url = 'https://news.google.com/rss/search?' + urllib.parse.urlencode({'q':f'{query} when:{days}d','hl':'es-419','gl':'UY','ceid':'UY:es-419'})
+    request = urllib.request.Request(rss_url, headers={'User-Agent':'Mozilla/5.0'})
+    with urllib.request.urlopen(request, timeout=14) as resp:
+        root = ET.fromstring(resp.read())
+    rows = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    for item in root.findall('./channel/item'):
+        title, link = (item.findtext('title') or '').strip(), (item.findtext('link') or '').strip()
+        source = item.find('source')
+        try:
+            timestamp = parsedate_to_datetime(item.findtext('pubDate') or '').astimezone(timezone.utc)
+        except (ValueError, TypeError, OverflowError):
+            continue
+        if title and link and timestamp >= cutoff:
+            rows.append({'fecha':timestamp.isoformat(),'plataforma':'Google News','autor':source.text if source is not None else 'Medio no identificado','texto':title,'url':link,'likes':0,'comentarios':0,'compartidos':0,'metricas_disponibles':False})
+    return rows
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_bluesky(query, days):
+    url = 'https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?' + urllib.parse.urlencode({'q':query,'limit':100,'sort':'latest'})
+    data = req_json(url)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    rows=[]
+    for post in data.get('posts',[]):
+        record = post.get('record',{})
+        date = record.get('createdAt') or post.get('indexedAt') or ''
+        try:
+            dt=datetime.fromisoformat(date.replace('Z','+00:00')).astimezone(timezone.utc)
+        except (ValueError, TypeError):
+            continue
+        if dt < cutoff: continue
+        author=post.get('author',{})
+        handle=author.get('handle','')
+        uri=post.get('uri','')
+        rkey=uri.rsplit('/',1)[-1]
+        link=f'https://bsky.app/profile/{handle}/post/{rkey}' if handle and rkey else ''
+        if not link: continue
+        rows.append({'fecha':dt.isoformat(),'plataforma':'Bluesky','autor':handle,'texto':record.get('text',''),'url':link,'likes':int(post.get('likeCount') or 0),'comentarios':int(post.get('replyCount') or 0),'compartidos':int(post.get('repostCount') or 0),'metricas_disponibles':True})
+    return rows
+
+def load_csv(upload):
+    text=io.StringIO(upload.getvalue().decode('utf-8-sig'))
+    reader=csv.DictReader(text)
+    required={'fecha','plataforma','autor','texto','url'}
+    if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+        raise ValueError('Columnas requeridas: fecha, plataforma, autor, texto, url')
+    rows=[]
+    for r in reader:
+        if not r.get('url','').strip() or not r.get('texto','').strip(): continue
+        try:
+            dt=datetime.fromisoformat(r['fecha'].strip().replace('Z','+00:00'))
+            if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError): continue
+        metrics={}
+        for k in ('likes','comentarios','compartidos'):
+            try: metrics[k]=max(0,int(r.get(k,'') or 0))
+            except (ValueError,TypeError): metrics[k]=0
+        has_metrics=any(str(r.get(k,'')).strip() for k in ('likes','comentarios','compartidos'))
         rows.append({'fecha':dt.isoformat(),'plataforma':r['plataforma'].strip(),'autor':r['autor'].strip(),'texto':r['texto'].strip(),'url':r['url'].strip(),'metricas_disponibles':has_metrics,**metrics})
     return rows
 
