@@ -1,143 +1,122 @@
-import csv
-import io
-import re
-import urllib.parse
-import urllib.request
-import xml.etree.ElementTree as ET
-from collections import Counter
-from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
+        rows.append({'fecha':dt.isoformat(),'plataforma':r['plataforma'].strip(),'autor':r['autor'].strip(),'texto':r['texto'].strip(),'url':r['url'].strip(),'metricas_disponibles':has_metrics,**metrics})
+    return rows
 
-import streamlit as st
+def dedup(rows):
+    return list({r['url'].split('?')[0].rstrip('/'):r for r in rows if r.get('url')}.values())
 
-st.set_page_config(page_title="Radar Político | Abiuy", page_icon="📡", layout="wide")
-st.title("📡 Radar Político")
-st.caption("Observatorio de conversación pública | ABIUY · Versión 0.1")
-st.info("Primera fuente: Google News (noticias indexadas). Todavía no mide menciones de X, Instagram o Facebook.")
-
-TEMAS = {
-    "Seguridad": ["seguridad", "policía", "policia", "delito", "homicidio", "narcotráfico", "narcotrafico"],
-    "Economía": ["economía", "economia", "impuesto", "empleo", "salario", "presupuesto"],
-    "Parlamento": ["senado", "senador", "parlamento", "comisión", "comision", "proyecto de ley", "diputados"],
-    "Educación": ["educación", "educacion", "escuela", "universidad", "liceo"],
-    "Política partidaria": ["partido colorado", "coalición", "coalicion", "frente amplio", "partido nacional"],
-}
-STOPWORDS = set("sobre desde entre hasta junto tras ante para como este esta estos estas esas esos pero porque donde cuando quien quienes algo todo toda todos todas desde hacia tiene tuvo será fueron esta está entre unas unos uruguay bordaberry pedro senado senador".split())
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def buscar_noticias(consulta, dias):
-    # Google News RSS devuelve una muestra de noticias indexadas, no un censo de las redes.
-    consulta_rss = f'{consulta} when:{dias}d'
-    url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
-        "q": consulta_rss, "hl": "es-419", "gl": "UY", "ceid": "UY:es-419"
-    })
-    solicitud = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 RadarPolitico/0.1"})
-    with urllib.request.urlopen(solicitud, timeout=12) as respuesta:
-        raiz = ET.fromstring(respuesta.read())
-    encontrados = []
-    for item in raiz.findall("./channel/item"):
-        titulo = (item.findtext("title") or "").strip()
-        enlace = (item.findtext("link") or "").strip()
-        origen = item.find("source")
-        fuente = origen.text.strip() if origen is not None and origen.text else "Sin identificar"
-        fecha_raw = item.findtext("pubDate") or ""
-        try:
-            fecha = parsedate_to_datetime(fecha_raw).astimezone(timezone.utc)
-        except (ValueError, TypeError):
-            continue
-        if fecha >= datetime.now(timezone.utc) - timedelta(days=dias) and titulo and enlace:
-            encontrados.append({"fecha": fecha.date().isoformat(), "titulo": titulo,
-                                "fuente": fuente, "url": enlace})
-    return list({n["url"]: n for n in encontrados}.values())
-
+if 'registros' not in st.session_state: st.session_state.registros=[]
+if 'estado_fuentes' not in st.session_state: st.session_state.estado_fuentes=[]
 with st.sidebar:
-    st.header("Configuración")
-    persona = st.text_input("Dirigente", "Pedro Bordaberry")
-    contexto = st.text_input("Tema o contexto", "Senado")
-    dias = st.selectbox("Período", [7, 14, 30], index=0, format_func=lambda x: f"Últimos {x} días")
-    st.caption("Por defecto busca el nombre completo y el contexto indicados.")
+    st.header('Configuración')
+    persona=st.text_input('Dirigente o expresión', 'Pedro Bordaberry')
+    tema=st.text_input('Tema (opcional)', 'Senado')
+    dias=st.selectbox('Período', [1,7,14,30], index=1, format_func=lambda x:f'Últimos {x} días')
+    news=st.checkbox('Google News', value=True)
+    bluesky=st.checkbox('Bluesky', value=True)
+    st.caption('Solo se miden las publicaciones efectivamente recuperadas. La búsqueda de Bluesky consulta hasta 100 resultados recientes por ejecución.')
+    run=st.button('🔄 Actualizar fuentes', type='primary', use_container_width=True)
+    st.divider()
+    uploaded=st.file_uploader('Importar publicaciones (CSV)', type=['csv'])
+    if uploaded and st.button('Agregar CSV a la sesión'):
+        try:
+            imported=load_csv(uploaded)
+            st.session_state.registros=dedup(st.session_state.registros+imported)
+            st.success(f'Importados {len(imported)} registros válidos (antes de deduplicar).')
+        except (ValueError,UnicodeDecodeError) as exc:
+            st.error(f'CSV inválido: {exc}')
+    template='fecha,plataforma,autor,texto,url,likes,comentarios,compartidos\n2026-10-20T09:00:00-03:00,X,cuenta_ejemplo,Texto de ejemplo,https://example.com/publicacion,12,3,2\n'
+    st.download_button('⬇️ Plantilla CSV (ejemplo)', template.encode('utf-8-sig'), 'plantilla_radar.csv', 'text/csv',use_container_width=True)
+    st.caption('La fila de la plantilla es ficticia: no la importes como dato real.')
 
-if not persona.strip():
-    st.warning("Escribí un nombre para comenzar.")
-    st.stop()
+if run:
+    query=f'"{persona.strip()}" {tema.strip()}'.strip()
+    if not persona.strip(): st.error('Escribí una expresión para buscar.')
+    else:
+        status=[]; fetched=[]
+        with st.spinner('Recuperando registros de las fuentes habilitadas…'):
+            for active,label,fn in [(news,'Google News',get_news),(bluesky,'Bluesky',get_bluesky)]:
+                if not active: continue
+                try:
+                    found=fn(query,dias)
+                    fetched.extend(found)
+                    status.append(f'{label}: {len(found)} registros devueltos')
+                except Exception as exc:
+                    status.append(f'{label}: no disponible ({type(exc).__name__})')
+        st.session_state.registros=dedup(st.session_state.registros+fetched)
+        st.session_state.estado_fuentes=status
+        st.session_state.actualizado=datetime.now(timezone.utc).isoformat()
 
-consulta = f'"{persona.strip()}" {contexto.strip()}'.strip()
-st.write(f"**Búsqueda:** `{consulta}`")
-if st.button("🔎 Buscar noticias", type="primary"):
+for item in st.session_state.estado_fuentes: st.caption('• '+item)
+if 'actualizado' in st.session_state: st.caption('Última consulta: '+st.session_state.actualizado+' UTC')
+
+all_rows=dedup(st.session_state.registros)
+cutoff=datetime.now(timezone.utc)-timedelta(days=dias)
+rows=[]
+for r in all_rows:
     try:
-        with st.spinner("Consultando Google News…"):
-            st.session_state["noticias"] = buscar_noticias(consulta, dias)
-            st.session_state["ultima_consulta"] = consulta
-            st.session_state["periodo"] = dias
-            st.session_state.pop("error", None)
-    except Exception as e:
-        st.session_state.pop("noticias", None)
-        st.session_state["error"] = f"No se pudo consultar el RSS: {type(e).__name__}. Probá de nuevo más tarde."
+        dt=datetime.fromisoformat(r['fecha'].replace('Z','+00:00'))
+        if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+        if dt>=cutoff: rows.append(r)
+    except (ValueError,TypeError): pass
 
-if "error" in st.session_state:
-    st.error(st.session_state["error"])
+platforms=sorted({r['plataforma'] for r in rows})
+selected=st.multiselect('Filtrar fuentes',platforms,default=platforms)
+rows=[r for r in rows if r['plataforma'] in selected]
+terms=Counter()
+topics=Counter()
+for r in rows:
+    txt=norm(r['texto'])
+    words=re.findall(r'[a-z]{4,}',txt)
+    terms.update(w for w in words if w not in STOP and w not in set(re.findall(r'[a-z]{4,}',norm(persona))))
+    for topic,keys in CATEGORIAS.items():
+        if any(norm(k) in txt for k in keys):topics[topic]+=1
 
-noticias = st.session_state.get("noticias")
-if noticias is None:
-    st.write("Presioná **Buscar noticias** para cargar registros reales.")
-    st.stop()
-
-st.caption(f"Consulta cargada: {st.session_state.get('ultima_consulta')} · {st.session_state.get('periodo')} días. Volvé a buscar si cambiaste los filtros.")
-tab_resumen, tab_publicaciones, tab_chat = st.tabs(["📊 Resumen", "📰 Publicaciones", "💬 Consultas"])
-conteo_fuentes = Counter(n["fuente"] for n in noticias)
-conteo_fechas = Counter(n["fecha"] for n in noticias)
-conteo_temas = Counter()
-for n in noticias:
-    t = n["titulo"].casefold()
-    for tema, palabras in TEMAS.items():
-        if any(p in t for p in palabras):
-            conteo_temas[tema] += 1
-palabras = Counter(w for n in noticias for w in re.findall(r"[a-záéíóúñü]{4,}", n["titulo"].lower()) if w not in STOPWORDS)
-
-with tab_resumen:
-    a, b, c = st.columns(3)
-    a.metric("Noticias encontradas", len(noticias))
-    b.metric("Medios identificados", len(conteo_fuentes))
-    c.metric("Días con noticias", len(conteo_fechas))
-    st.caption("Son artículos devueltos por Google News RSS, no menciones totales de redes sociales. Los tópicos pueden superponerse.")
-    if noticias:
-        st.subheader("Evolución diaria")
-        st.bar_chart({"Noticias": dict(sorted(conteo_fechas.items()))})
-        st.subheader("Temas detectados en titulares")
-        if conteo_temas:
-            st.bar_chart({"Noticias con el tema": dict(conteo_temas.most_common())})
-        else:
-            st.write("No aparecen los temas del diccionario en los titulares recolectados.")
-        st.subheader("Palabras frecuentes en titulares")
-        st.write(" · ".join(f"**{p}** ({n})" for p, n in palabras.most_common(15)) or "Sin datos")
-    else:
-        st.warning("No encontramos noticias para esta búsqueda y período. Probá quitando el contexto o usando 30 días.")
-
-with tab_publicaciones:
-    if noticias:
-        medios = sorted(conteo_fuentes)
-        seleccion = st.multiselect("Filtrar medios", medios, default=medios)
-        filtradas = [n for n in noticias if n["fuente"] in seleccion]
-        for n in sorted(filtradas, key=lambda x: x["fecha"], reverse=True):
-            st.markdown(f'**{n["fecha"]} · {n["fuente"]}**')
-            st.link_button(n["titulo"], n["url"])
-        salida = io.StringIO()
-        escritor = csv.DictWriter(salida, fieldnames=["fecha", "titulo", "fuente", "url"])
-        escritor.writeheader()
-        escritor.writerows(filtradas)
-        st.download_button("⬇️ Descargar CSV", salida.getvalue().encode("utf-8-sig"), "radar_politico.csv", "text/csv")
-    else:
-        st.write("No hay publicaciones para mostrar.")
-
-with tab_chat:
-    st.write("**Consultas guiadas sobre los datos cargados** (todavía no es un chat de IA).")
-    pregunta = st.selectbox("¿Qué querés saber?", ["¿Cuántas noticias hay?", "¿Qué medios publicaron más?", "¿Qué temas aparecen?", "¿Cuáles son las palabras más frecuentes?"])
-    if pregunta == "¿Cuántas noticias hay?":
-        st.write(f"La búsqueda devolvió **{len(noticias)}** noticias indexadas en el período elegido.")
-    elif pregunta == "¿Qué medios publicaron más?":
-        st.write("; ".join(f"{medio}: {n}" for medio, n in conteo_fuentes.most_common(10)) or "No hay datos.")
-    elif pregunta == "¿Qué temas aparecen?":
-        st.write("; ".join(f"{tema}: {n}" for tema, n in conteo_temas.most_common()) or "Ninguno de los temas predefinidos.")
-    else:
-        st.write("; ".join(f"{palabra}: {n}" for palabra, n in palabras.most_common(15)) or "No hay datos.")
-    st.caption("La evidencia está en la pestaña Publicaciones. Esta versión solo analiza titulares, no artículos completos.")
+summary, words_tab, posts_tab, chat_tab=st.tabs(['📊 Resumen','🔤 Palabras y tópicos','🗂️ Publicaciones','💬 Consultas'])
+with summary:
+    a,b,c,d=st.columns(4)
+    a.metric('Publicaciones registradas',len(rows))
+    b.metric('Fuentes presentes',len({r['plataforma'] for r in rows}))
+    c.metric('Autores identificados',len({(r['plataforma'],r['autor']) for r in rows if r['autor']}))
+    metrics_rows=[r for r in rows if r.get('metricas_disponibles')]
+    d.metric('Interacciones informadas',sum(r[k] for r in metrics_rows for k in ('likes','comentarios','compartidos')))
+    st.caption(f'Interacciones: solo {len(metrics_rows)} registros con métricas disponibles. Sin métricas no significa cero interacciones. Cobertura NO exhaustiva.')
+    bydate=Counter(r['fecha'][:10] for r in rows)
+    if bydate: st.subheader('Publicaciones por día');st.bar_chart([{'fecha':k,'publicaciones':v} for k,v in sorted(bydate.items())],x='fecha',y='publicaciones')
+    byplatform=Counter(r['plataforma'] for r in rows)
+    if byplatform: st.subheader('Registros por plataforma'); st.bar_chart([{'plataforma':k,'registros':v} for k,v in byplatform.items()],x='plataforma',y='registros',horizontal=True)
+    if not rows: st.warning('Todavía no hay registros para los filtros seleccionados. Usá «Actualizar fuentes» o importá un CSV.')
+with words_tab:
+    st.subheader('Palabras más frecuentes')
+    st.caption('Conteos de términos presentes en los textos recuperados. No representa toda la conversación pública.')
+    if terms: st.bar_chart([{'palabra':k,'veces':v} for k,v in terms.most_common(20)],x='palabra',y='veces',horizontal=True)
+    else:st.write('Sin textos suficientes.')
+    st.subheader('Tópicos detectados')
+    st.caption('Un registro puede pertenecer a varias categorías; los valores no suman necesariamente 100 %.')
+    if topics:st.bar_chart([{'topico':k,'registros':v} for k,v in topics.most_common()],x='topico',y='registros',horizontal=True)
+    else:st.write('No se identificaron categorías del diccionario.')
+    keyword=st.text_input('Rastrear palabra o frase específica', 'seguridad')
+    if keyword.strip():
+        matched=[r for r in rows if norm(keyword.strip()) in norm(r['texto'])]
+        st.metric(f'Registros con «{keyword}»',len(matched))
+        if matched:st.write('Ejemplos:');[(st.markdown(f'- [{r["texto"][:130]}]({r["url"]})')) for r in matched[:10]]
+with posts_tab:
+    st.subheader('Registros y evidencia')
+    st.caption('La fecha, texto y métricas dependen de la fuente; las publicaciones importadas son responsabilidad de quien las carga.')
+    for r in sorted(rows,key=lambda z:z['fecha'],reverse=True)[:200]:
+        st.markdown(f'**{r["plataforma"]} · {r["fecha"][:16]} · {r["autor"]}**')
+        st.write(r['texto'][:750])
+        st.link_button('Abrir publicación',r['url'])
+        if r.get('metricas_disponibles'):st.caption(f'♥ {r["likes"]} · Comentarios {r["comentarios"]} · Compartidos {r["compartidos"]}')
+        st.divider()
+    fields=['fecha','plataforma','autor','texto','url','likes','comentarios','compartidos']
+    buffer=io.StringIO();writer=csv.DictWriter(buffer,fieldnames=fields);writer.writeheader()
+    for r in rows:writer.writerow({k:r.get(k,'') if (k not in ('likes','comentarios','compartidos') or r.get('metricas_disponibles')) else '' for k in fields})
+    st.download_button('⬇️ Exportar CSV / guardar historial',buffer.getvalue().encode('utf-8-sig'),'radar_exportacion.csv','text/csv')
+with chat_tab:
+    st.write('Consultas guiadas, no chat generativo de IA. Todas las respuestas salen del conjunto de datos visible.')
+    q=st.selectbox('Elegí una pregunta',['¿Qué fuentes aportaron registros?','¿Qué palabras aparecen más?','¿Qué tópicos aparecen?','¿Qué días registraron más publicaciones?'])
+    if q.startswith('¿Qué fuentes'):st.write(', '.join(f'{k}: {v}' for k,v in Counter(r['plataforma'] for r in rows).most_common()) or 'Sin registros.')
+    elif 'palabras' in q:st.write(', '.join(f'{k} ({v})' for k,v in terms.most_common(12)) or 'Sin registros.')
+    elif 'tópicos' in q:st.write(', '.join(f'{k} ({v})' for k,v in topics.most_common()) or 'Sin registros.')
+    else:st.write(', '.join(f'{k} ({v})' for k,v in Counter(r['fecha'][:10] for r in rows).most_common(10)) or 'Sin registros.')
+st.warning('Historial provisional: los registros de esta versión se guardan en la sesión del navegador. Exportá el CSV antes de cerrar y reimportalo cuando vuelvas. Para monitoreo continuo y alertas hace falta almacenamiento persistente y una tarea programada.')
